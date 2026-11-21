@@ -1,0 +1,83 @@
+# aiscan — AI API leaked-key scanner
+#
+# Packaging notes
+# --------------
+# * Standard library only: the whole runtime (aiscan.py, common.py,
+#   confidence.py, engine.py, metrics.py, savings.py, selftest.py,
+#   vault.py, continuous.py and the detectors/ sources/ reporters/
+#   verifiers/ packages) imports nothing outside the stdlib, so
+#   `dependencies` is intentionally empty. Keep it that way — a CI
+#   add-on should install in seconds with no dependency risk.
+# * The research/analysis scripts at the repo root (classify_*.py,
+#   trial_run*.py, fresh_liveness_*.py, exposed_since_606.py,
+#   phase2_trial3.py, retry_trial3.py, score_results.py) and the
+#   standalone sibling CLIs (repos.py, verify_own.py,
+#   fingerprint_watch.py) are NOT part of the installed package: they
+#   are one-off harnesses / separate entry points, not runtime code of
+#   the `aiscan` command. If aiscan.py ever imports one of them, add it
+#   to py-modules below.
+# * `tests` is shipped as a package only so `aiscan selftest` can find
+#   its fixtures (tests/fixtures/*) in a wheel install. It contains no
+#   importable test helpers beyond the fixtures.
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aiscan"
+version = "0.1.0"
+description = "Provider-agnostic scanner for leaked AI API keys — an add-on layer that catches AI-specific keys (13 providers) that slip past general secret scanners."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [
+    { name = "aiscan contributors" },
+]
+keywords = ["security", "secret-scanning", "api-keys", "ai", "ci"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+]
+dependencies = []
+
+# Optional: only the encrypted vault (vault.py) needs anything beyond
+# the standard library. It is deliberately an extra, not a hard
+# dependency — the scan engine, reporters, CI action and pre-commit
+# hook all run stdlib-only. `aiscan selftest` exercises the vault
+# scorecard, so a full selftest needs the extra installed.
+[project.optional-dependencies]
+vault = ["cryptography>=42"]
+
+[project.urls]
+# Placeholder: the repo has not been pushed to GitHub yet. Replace
+# <you> with the real org/user when publishing.
+Homepage = "https://github.com/<you>/aiscan"
+Repository = "https://github.com/<you>/aiscan"
+Issues = "https://github.com/<you>/aiscan/issues"
+
+[project.scripts]
+aiscan = "aiscan:main"
+
+[tool.setuptools]
+py-modules = [
+    "aiscan",
+    "common",
+    "confidence",
+    "continuous",
+    "engine",
+    "metrics",
+    "savings",
+    "selftest",
+    "vault",
+]
+packages = ["detectors", "sources", "reporters", "verifiers", "tests"]
+
+[tool.setuptools.package-data]
+# NOTE: `fixtures/*` alone does NOT match dotfiles — the planted keys
+# live in fixtures/.env and fixtures/.mcp.json, so list them explicitly.
+tests = ["fixtures/*", "fixtures/.*"]

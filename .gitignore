@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+.env
+.env.*
+
+# aiscan run artifacts (reports contain masked findings only, but they are
+# per-run output, not source — regenerate with `python3 aiscan.py ...`)
+*.metrics.json
+demo/last-demo-report.md
+results/
+report.md
+report.json
+keysentry-report.json
+
+# Encrypted vault (holds ciphertext only, but treat it as sensitive)
+.aiscan/
+vault.json
+vault-audit.jsonl
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+test-live/

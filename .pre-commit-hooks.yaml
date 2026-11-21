@@ -1,0 +1,30 @@
+# KeySentry pre-commit hook — scan staged files for leaked AI API keys.
+#
+# An ADD-ON layer, not a replacement for your existing secret scanners:
+# it catches AI-specific API keys (13 providers) that slip past general
+# scanners. Reports are masked-only (prefix4 + SHA-256 fingerprints) —
+# no raw key is ever logged, and verification is off, so no found key
+# is ever sent to a provider API.
+#
+# In your repo's .pre-commit-config.yaml:
+#   repos:
+#     - repo: https://github.com/<you>/aiscan
+#       rev: v0.1.0
+#       hooks:
+#         - id: keysentry-scan
+#           args: [--fail-on, high]   # or: critical | medium | low | none
+#
+# The hook needs the scanner available: either `aiscan` installed on
+# PATH (`pip install .` from the aiscan repo) or the hook repo's own
+# aiscan.py, which the hook script falls back to.
+- id: keysentry-scan
+  name: KeySentry leaked AI-key scan
+  description: >-
+    Add-on scan for leaked AI API keys (13 providers) in staged files.
+    Does not replace existing secret scanners — it catches AI-specific
+    keys that slip past them. Masked output only; no raw key is ever
+    logged, and no found key is ever sent to a provider API.
+  entry: scripts/pre-commit-hook
+  language: script
+  args: [--fail-on, high]
+  pass_filenames: true

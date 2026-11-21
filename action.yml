@@ -1,0 +1,113 @@
+# KeySentry — leaked AI API key scan (GitHub Action)
+#
+# An ADD-ON layer, not a replacement: it does not replace your existing
+# secret scanners (gitleaks, TruffleHog, GitHub secret scanning, ...).
+# It catches what slips past them — AI-specific API keys from 13
+# providers (OpenAI, Anthropic, Gemini, Groq, OpenRouter, DeepSeek,
+# xAI, Perplexity, Hugging Face, Replicate, Mistral, Cohere, Together
+# AI) — in your repo and its git history, including leaks outside the
+# pipeline.
+#
+# Safety, by construction:
+#   * Reports are MASKED-ONLY: prefix4-masked values + SHA-256
+#     fingerprints. The scanner aborts rather than ever writing a full
+#     secret, and no raw key is ever logged or uploaded.
+#   * Verification is OFF: no found key is ever sent to a provider API.
+#   * No paid services, no credentials needed for the local scan.
+#
+# Usage (in a customer repo):
+#   - uses: <owner>/aiscan@v1
+#     with:
+#       paths: '.'        # path(s) in the checked-out repo to scan
+#       fail-on: 'high'   # fail the step on critical/high findings
+name: "KeySentry — leaked AI API key scan"
+description: >-
+  Add-on scan for leaked AI API keys (13 providers) in your repo. It does
+  NOT replace your existing secret scanners — it catches AI-specific keys
+  that slip past them, including leaks outside the pipeline. Reports are
+  masked-only (prefix4 + SHA-256 fingerprints); raw keys are never logged,
+  uploaded, or sent to any provider API. No paid services.
+
+inputs:
+  paths:
+    description: >-
+      Space-separated path(s) in the checked-out repo to scan
+      (default: repository root).
+    required: false
+    default: "."
+  fail-on:
+    description: >-
+      Minimum severity that fails the step: critical, high, medium, low,
+      or none (never fail). Default: high.
+    required: false
+    default: "high"
+  github-token:
+    description: >-
+      Optional GitHub token. Reserved for a future code-search mode; the
+      local scan does not call the GitHub API and does not need a token.
+    required: false
+    default: ""
+  config:
+    description: >-
+      Optional path to a config file. Reserved — the CLI does not support
+      config files yet; if set, the action warns and continues with
+      defaults.
+    required: false
+    default: ""
+
+outputs:
+  findings-file:
+    description: "Path to the masked-only JSON report (keysentry-report.json in the workspace root)."
+    value: ${{ steps.check.outputs.findings-file }}
+  finding-count:
+    description: "Total number of findings in the report."
+    value: ${{ steps.check.outputs.finding-count }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install aiscan from the action repo
+      shell: bash
+      run: |
+        python -m pip install --quiet "${{ github.action_path }}"
+        aiscan --help >/dev/null
+
+    - name: Scan repo (masked-only JSON report)
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: |
+        if [ -n "${{ inputs.config }}" ]; then
+          echo "::warning::KeySentry: 'config' is reserved — the CLI does not support config files yet; continuing with defaults."
+        fi
+        mkdir -p "${{ runner.temp }}/keysentry"
+        i=0
+        for path in ${{ inputs.paths }}; do
+          i=$((i + 1))
+          aiscan scan local "$path" \
+            --format json \
+            --output "${{ runner.temp }}/keysentry/report-${i}.json" \
+            --no-metrics
+        done
+        python "${{ github.action_path }}/scripts/merge_reports.py" \
+          "${{ runner.temp }}"/keysentry/report-*.json \
+          -o keysentry-report.json
+
+    - name: Check findings against fail-on threshold
+      id: check
+      shell: bash
+      run: |
+        python "${{ github.action_path }}/scripts/check_report.py" \
+          --fail-on "${{ inputs.fail-on }}" keysentry-report.json
+
+    - name: Upload masked report as artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: keysentry-report
+        path: keysentry-report.json
+        if-no-files-found: error

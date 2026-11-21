@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""pre-commit hook entry point for KeySentry (aiscan).
+
+Scans each staged file with the local aiscan engine and fails the
+commit when a finding meets `--fail-on` (default: high).
+
+How it finds the scanner:
+  1. an installed `aiscan` console command on PATH (e.g. `pip install .`
+     from the aiscan repo), or
+  2. `aiscan.py` in the repo this script lives in (the hook repo clone
+     that pre-commit checks out).
+
+Reports are masked-only: `aiscan scan local --format json` serializes
+prefix4-masked values and SHA-256 fingerprints, and aborts if a full
+secret would ever be written. This script only ever reads those masked
+reports and prints file:line/provider/severity lines — never a key
+value. Verification is never enabled here.
+
+Usage (invoked by pre-commit; filenames are appended automatically):
+  scripts/pre-commit-hook [--fail-on {critical,high,medium,low,none}]
+                          <file> [<file> ...]
+"""
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+SEVERITIES = ("critical", "high", "medium", "low", "none")
+
+
+def _repo_root() -> str:
+    # This script lives in <repo>/scripts/; the scanner is at <repo>/.
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _find_cli() -> list[str]:
+    installed = shutil.which("aiscan")
+    if installed:
+        return [installed]
+    fallback = os.path.join(_repo_root(), "aiscan.py")
+    if os.path.isfile(fallback):
+        return [sys.executable, fallback]
+    print("error: no installed `aiscan` on PATH and no aiscan.py found "
+          f"next to this hook ({fallback}). Install with "
+          "`pip install .` from the aiscan repo.", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    fail_on = "high"
+    files: list[str] = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--fail-on" and i + 1 < len(argv):
+            fail_on = argv[i + 1]
+            i += 2
+        elif argv[i].startswith("--fail-on="):
+            fail_on = argv[i].split("=", 1)[1]
+            i += 1
+        else:
+            files.append(argv[i])
+            i += 1
+    if fail_on not in SEVERITIES:
+        print(f"error: --fail-on must be one of {', '.join(SEVERITIES)}",
+              file=sys.stderr)
+        return 2
+
+    cli = _find_cli()
+    check_script = os.path.join(_repo_root(), "scripts", "check_report.py")
+    reports: list[str] = []
+    tmpdir = tempfile.mkdtemp(prefix="keysentry-hook-")
+    try:
+        for name in files:
+            path = name if os.path.isabs(name) else os.path.join(os.getcwd(), name)
+            if not os.path.isfile(path):
+                # Deleted file still staged, or a directory: nothing to scan.
+                print(f"note: skipping {name} (not a file on disk)",
+                      file=sys.stderr)
+                continue
+            out = os.path.join(tmpdir, f"report-{len(reports)}.json")
+            cmd = cli + ["scan", "local", path,
+                         "--format", "json", "--output", out, "--no-metrics"]
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode != 0:
+                print(f"error: scan failed for {name} "
+                      f"(exit {proc.returncode})", file=sys.stderr)
+                if proc.stderr.strip():
+                    print(proc.stderr.strip(), file=sys.stderr)
+                return 2
+            reports.append(out)
+        if not reports:
+            print("KeySentry: no scannable staged files.")
+            return 0
+        # One masked-only summary + the fail-on decision, shared with CI.
+        check = subprocess.run(
+            [sys.executable, check_script, "--fail-on", fail_on] + reports)
+        return check.returncode
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

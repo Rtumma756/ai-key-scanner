@@ -1,0 +1,8 @@
+# Decoys — these must NOT be flagged by aiscan.
+request_id = "550e8400-e29b-41d4-a716-446655440000"
+checksum = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+api_key = "your-api-key-here"
+password = "changeme"
+openai_api_key = "sk-test-1234567890abcdef"
+# example key format: sk-proj-REPLACE-ME
+database_url = "postgres://user:password@localhost:5432/mydb"
