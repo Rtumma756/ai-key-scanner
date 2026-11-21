@@ -18,6 +18,15 @@ Design notes:
   only for values that clear the entropy threshold and do not look like
   placeholders. This is what keeps UUIDs, hashes and ``your-api-key-here``
   out of the results.
+- Example / test keys: ``scan_line`` drops values that are marked as
+  examples (see ``is_example_key``) by default, so a repo's docs, tests
+  and fixtures do not fail a CI gate with fake keys. This is a *reporting*
+  filter, not a detection change: the regexes still match the value, and
+  ``scan_line(line, allow_examples=True)`` returns it — the self-test uses
+  that mode to prove detection still works. The bundled demo source
+  (``sources/demo.py``, in-memory synthetic data) sets ``allow_examples``
+  so demo mode still demonstrates the full flow; every real scan path
+  (local, git history, repo, internet) filters examples.
 """
 from __future__ import annotations
 
@@ -36,6 +45,63 @@ PLACEHOLDER_WORDS = (
     "sample", "replace", "changeme", "todo", "none", "null", "redacted",
     "insert", "here", "demo",
 )
+
+# ---------------------------------------------------------------------------
+# Example / test-key filter (is_example_key)
+# ---------------------------------------------------------------------------
+# A value carrying one of these markers is an example key, not a real
+# credential. Matching is deliberately conservative, because a false
+# negative here means a real leak is silently dropped:
+# - Compound markers are matched as substrings. "TESTFAKE", "DEMOFAKE"
+#   and "DEADBEEF" never occur in a genuine random key (a specific
+#   8-char string in a 32-char hex key has P ~ 6e-9; the compound
+#   TESTFAKE/DEMOFAKE strings are longer still).
+# - Long words (>= 5 chars: example, changeme, placeholder, redacted,
+#   sample, dummy, changethis) are matched as substrings. A specific
+#   5+-char string in a 20+-char random key has P <= ~1e-8 per key.
+# - Short words (test, fake, demo, mock, xxx, none, null, todo, insert,
+#   replace, your, here) are matched ONLY as delimited tokens (bounded
+#   by a non-alphanumeric or the value boundary). A random base62 key
+#   can contain "test" or "fake" by chance (P ~ 1e-6 per key), so
+#   substring matching them would eventually suppress a real key.
+#   A human writing an example delimits the word ("sk_test_...",
+#   "FAKE_KEY", "demo-key"), so token matching catches the realistic
+#   cases. Bare "FAKE" glued to random characters (e.g. "sk-proj-FAKEa1b2...")
+#   is NOT filtered — that is the documented trade-off; use TESTFAKE.
+# - Test-key prefixes (Stripe-style sk_test_ / pk_test_ / rk_test_) are
+#   structural: a real production key never starts with them.
+EXAMPLE_MARKER_SUBSTRINGS = (
+    "testfake", "demofake", "deadbeef",
+    "example", "changeme", "placeholder", "redacted", "sample", "dummy",
+    "changethis",
+)
+EXAMPLE_WORD_TOKENS = (
+    "test", "fake", "demo", "mock", "xxx", "none", "null", "todo",
+    "insert", "replace", "your", "here",
+)
+EXAMPLE_TEST_KEY_PREFIXES = (
+    "sk_test_", "pk_test_", "rk_test_", "sk-test-", "-test-", "_test_",
+)
+_EXAMPLE_WORD_RE = re.compile(
+    r"(?i)(?:^|[^a-z0-9])(" + "|".join(EXAMPLE_WORD_TOKENS) + r")(?:[^a-z0-9]|$)"
+)
+
+
+def is_example_key(value: str) -> bool:
+    """True when ``value`` is marked as an example / test key.
+
+    Only the matched value is inspected — never the file path. A real key
+    committed in a test file or fixture is still a real leak, so paths
+    (tests/, fixtures/, docs/, demo/) are deliberately NOT a signal here.
+    """
+    if not value:
+        return False
+    lowered = value.lower()
+    if any(marker in lowered for marker in EXAMPLE_MARKER_SUBSTRINGS):
+        return True
+    if any(prefix in lowered for prefix in EXAMPLE_TEST_KEY_PREFIXES):
+        return True
+    return bool(_EXAMPLE_WORD_RE.search(value))
 
 
 @dataclass
@@ -135,14 +201,23 @@ def _resolve_overlaps(matches: list) -> list:
     return kept
 
 
-def _entropy_fallback(line: str):
-    """Generic secret-looking assignment, gated by entropy + placeholders."""
+def _entropy_fallback(line: str, allow_examples: bool = False):
+    """Generic secret-looking assignment, gated by entropy + placeholders.
+
+    ``allow_examples`` bypasses the example-key checks (both the new
+    ``is_example_key`` filter and the older PLACEHOLDER_WORDS check) —
+    used by the self-test to prove detection still works on marked
+    fixture values. Real scan paths never set it.
+    """
     for m in _FALLBACK_RE.finditer(line):
         value = m.group(2).strip("\"' ")
         if len(value) < MIN_GENERIC_LENGTH:
             continue
+        if not allow_examples and is_example_key(value):
+            continue
         lowered = value.lower()
-        if any(word in lowered for word in PLACEHOLDER_WORDS):
+        if not allow_examples and any(word in lowered
+                                      for word in PLACEHOLDER_WORDS):
             continue
         if shannon_entropy(value) < ENTROPY_THRESHOLD:
             continue
@@ -160,8 +235,16 @@ def _classify_context(line: str):
     return "Unknown (generic)", "Generic API key/token", ""
 
 
-def scan_line(line: str) -> list:
-    """Return all credential candidates found in one line of text."""
+def scan_line(line: str, allow_examples: bool = False) -> list:
+    """Return all credential candidates found in one line of text.
+
+    Values marked as example / test keys (see ``is_example_key``) are
+    dropped unless ``allow_examples`` is True. Detection itself is
+    unchanged: the regexes still match the value, so
+    ``scan_line(line, allow_examples=True)`` proves a marked value is
+    still detectable. When every regex match on the line is an example,
+    the entropy fallback still runs — and it applies the same filter.
+    """
     matches: list = []
     low = line.lower()
     for det in DETECTORS:
@@ -171,13 +254,15 @@ def scan_line(line: str) -> list:
             continue
         for m in re.finditer(det.pattern, line):
             value = m.group(1) if m.lastindex else m.group(0)
+            if not allow_examples and is_example_key(value):
+                continue
             via = "context" if det.requires_context else "regex"
             matches.append(RawMatch(det.provider, det.cred_type, value,
                                     m.start(), m.end(), det.console_url,
                                     det.verify_key, det.severity, via))
     matches = _resolve_overlaps(matches)
     if not matches:
-        fallback = _entropy_fallback(line)
+        fallback = _entropy_fallback(line, allow_examples=allow_examples)
         if fallback is not None:
             matches.append(fallback)
     return matches

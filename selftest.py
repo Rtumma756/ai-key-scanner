@@ -1,13 +1,28 @@
 """Self-test harness for aiscan: precision/recall scorecard on fixtures.
 
-Expected fixture findings (provider -> count). The Anthropic key is planted
-in both app.py and .mcp.json on purpose: dedup must report it once, so the
-expected total is 16 unique findings from 17 plantings.
+Fixture values are all marked as examples (TESTFAKE markers, or a
+deadbeef hex value for DeepSeek/Together, whose formats are hex-only).
+The engine's example-key filter drops them from findings by default,
+so the scorecard checks BOTH modes:
+
+- detection mode (``allow_examples=True``): the detectors still match
+  the values — expected fixture findings (provider -> count). The
+  Anthropic key is planted in both app.py and .mcp.json on purpose:
+  dedup must report it once, so the expected total is 16 unique
+  findings from 17 plantings.
+- filter mode (default): the same scan reports 0 findings — every
+  planted value is an example key.
+- negative control: a runtime-generated realistic-looking key (no
+  marker, built from a hash at test time so no real-looking literal
+  sits in the repo) IS reported, proving the filter does not suppress
+  genuine keys.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import sys
+import tempfile
 from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -51,7 +66,9 @@ def _scorecard(title: str, checks: list) -> bool:
 
 
 def fixture_scorecard() -> bool:
-    findings = scan_source(LocalSource(FIXTURES))
+    # Detection mode: the filter is bypassed, so every planted value
+    # must be detected exactly as before the example-key filter existed.
+    findings = scan_source(LocalSource(FIXTURES), allow_examples=True)
     counts = Counter(f.provider for f in findings)
     checks = []
 
@@ -92,6 +109,31 @@ def fixture_scorecard() -> bool:
     checks.append(("redaction (no full key in JSON/Markdown)",
                    not leaked,
                    "clean" if not leaked else f"LEAKED: {leaked}"))
+
+    # Filter mode (default): every planted fixture value is an example
+    # key, so the same scan must report no findings at all.
+    filtered = scan_source(LocalSource(FIXTURES))
+    checks.append(("example filter drops all fixture keys",
+                   len(filtered) == 0,
+                   f"{len(filtered)} finding(s) with filter on"
+                   + (f": {[f.location for f in filtered]}"
+                      if filtered else "")))
+
+    # Negative control: a realistic-looking key with no example marker,
+    # generated at runtime (never a literal in the repo), IS reported.
+    # This proves the filter suppresses marked examples, not real keys.
+    real_hex = hashlib.sha256(b"selftest-negative-control").hexdigest()[:48]
+    real_value = f"sk-{real_hex}"
+    with tempfile.TemporaryDirectory() as td:
+        with open(os.path.join(td, "app.py"), "w", encoding="utf-8") as f:
+            f.write(f'OPENAI_API_KEY = "{real_value}"\n')
+        control = scan_source(LocalSource(td))
+    checks.append(("unmarked realistic key is still reported",
+                   len(control) == 1 and control[0].provider == "OpenAI"
+                   and control[0].value == real_value,
+                   f"{len(control)} finding(s)"
+                   + (f", provider {control[0].provider}"
+                      if control else "")))
 
     # Demo mode: bundled fake dataset produces findings.
     demo = scan_source(DemoSource())

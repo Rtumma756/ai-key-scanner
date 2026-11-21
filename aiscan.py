@@ -698,10 +698,17 @@ def cmd_scan_commoncrawl(args) -> int:
 
 
 def cmd_metrics(args) -> int:
-    """Fixture precision/recall scorecard (reuses selftest expectations)."""
+    """Fixture precision/recall scorecard (reuses selftest expectations).
+
+    Scans the fixtures in detection mode (allow_examples=True): the
+    scorecard measures whether the detectors still match the planted
+    values. With the example-key filter on, the same fixtures report
+    0 findings by design (see selftest.fixture_scorecard).
+    """
     from sources import LocalSource
     metrics = RunMetrics("metrics:fixtures")
-    findings = scan_source(LocalSource("tests/fixtures"), metrics=metrics)
+    findings = scan_source(LocalSource("tests/fixtures"),
+                           allow_examples=True, metrics=metrics)
     metrics.finalize(findings)
     score = fixture_scorecard(findings)
     print(render_fixture_scorecard(score))
