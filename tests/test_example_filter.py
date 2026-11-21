@@ -118,6 +118,27 @@ def test_scan_line_keeps_real_key_next_to_example():
     assert [f.value for f in found] == [real]
 
 
+def test_scan_line_filters_marker_glued_before_key():
+    # Regression (Nov 21, 2026): the dogfood Action failed on
+    # tests/fixtures/agents/.mcp.json, whose value is
+    # "TESTFAKE-gsk_aaa...". The Groq regex matches only the gsk_...
+    # part, so the TESTFAKE marker sits outside the matched value,
+    # glued to it in one token. The enclosing-token check must drop it.
+    line = '"GROQ_API_KEY":"TESTFAKE-gsk_' + "a" * 40 + '"'
+    assert scan_line(line) == []
+    found = scan_line(line, allow_examples=True)
+    assert len(found) == 1 and found[0].provider == "Groq"
+
+
+def test_scan_line_keeps_real_key_with_marker_elsewhere_on_line():
+    # TESTFAKE in a trailing comment must not rescue a real key: the
+    # marker is not in the token the matched secret sits in.
+    real = "gsk_" + hashlib.sha256(b"groq-realistic-2").hexdigest()[:32]
+    line = f'GROQ_API_KEY="{real}"  # see TESTFAKE docs'
+    found = scan_line(line)
+    assert [f.value for f in found] == [real]
+
+
 # --- scan_source integration: mixed directory -----------------------------
 def test_scan_source_filters_examples_but_keeps_real(tmp_path):
     (tmp_path / "example.py").write_text(

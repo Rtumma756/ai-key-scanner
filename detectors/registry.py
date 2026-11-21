@@ -235,15 +235,38 @@ def _classify_context(line: str):
     return "Unknown (generic)", "Generic API key/token", ""
 
 
+def _enclosing_token(line: str, start: int, end: int) -> str:
+    """The contiguous key-like token a match sits in.
+
+    A marker can sit just outside the regex match, glued to the secret in
+    the same token — e.g. ``"TESTFAKE-gsk_aaa..."`` in an MCP config,
+    where the Groq pattern matches only the ``gsk_...`` part. The token
+    is the maximal run of key characters around the match, bounded by
+    quotes, whitespace or other punctuation, so a marker elsewhere on
+    the line (a comment, a neighbouring field) is never pulled in.
+    """
+    i = start
+    while i > 0 and (line[i - 1].isalnum() or line[i - 1] in "_.-"):
+        i -= 1
+    j = end
+    while j < len(line) and (line[j].isalnum() or line[j] in "_.-"):
+        j += 1
+    return line[i:j]
+
+
 def scan_line(line: str, allow_examples: bool = False) -> list:
     """Return all credential candidates found in one line of text.
 
     Values marked as example / test keys (see ``is_example_key``) are
-    dropped unless ``allow_examples`` is True. Detection itself is
-    unchanged: the regexes still match the value, so
-    ``scan_line(line, allow_examples=True)`` proves a marked value is
-    still detectable. When every regex match on the line is an example,
-    the entropy fallback still runs — and it applies the same filter.
+    dropped unless ``allow_examples`` is True. The check covers both
+    the matched secret and the token it sits in, because a marker can
+    be glued to the front of the key, outside the regex match
+    (``TESTFAKE-gsk_...``). A marker elsewhere on the line does not
+    rescue a real key. Detection itself is unchanged: the regexes
+    still match the value, so ``scan_line(line, allow_examples=True)``
+    proves a marked value is still detectable. When every regex match
+    on the line is an example, the entropy fallback still runs — and
+    it applies the same filter.
     """
     matches: list = []
     low = line.lower()
@@ -256,6 +279,11 @@ def scan_line(line: str, allow_examples: bool = False) -> list:
             value = m.group(1) if m.lastindex else m.group(0)
             if not allow_examples and is_example_key(value):
                 continue
+            if not allow_examples:
+                vstart = m.start(1) if m.lastindex else m.start()
+                vend = m.end(1) if m.lastindex else m.end()
+                if is_example_key(_enclosing_token(line, vstart, vend)):
+                    continue
             via = "context" if det.requires_context else "regex"
             matches.append(RawMatch(det.provider, det.cred_type, value,
                                     m.start(), m.end(), det.console_url,
