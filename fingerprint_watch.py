@@ -61,6 +61,115 @@ from datetime import datetime, timezone
 DEFAULT_BASE_URL = "https://key-sentry-inky.vercel.app"
 DEFAULT_FINGERPRINTS_FILE = "fingerprints.json"
 
+# Plan gating (freemium layer): plans.py is the CLI-side source of
+# truth for limits and upgrade copy. Best-effort import so this file
+# still works as a standalone copy; the fallback below enforces the
+# Free limit (5 fingerprints) with the same upgrade wording.
+try:
+    import plans as _plans
+except ImportError:  # plans.py not on the path
+    _plans = None
+
+FREE_FINGERPRINT_LIMIT = 5  # fallback when plans.py is unavailable
+STARTER_FINGERPRINT_LIMIT = 25  # fallback when plans.py is unavailable
+
+
+def _resolve_plan(args: argparse.Namespace) -> str:
+    """Plan to enforce: --plan wins, then the local .key-sentry-plan.json
+    state file (plans.py), else Free. Never raises."""
+    explicit = getattr(args, "plan", None)
+    if explicit:
+        return explicit
+    if _plans is not None:
+        return _plans.load_local_plan()
+    return "free"
+
+
+def _fingerprint_check_key(fp: str) -> str:
+    """Daily-counter key for one fingerprint's check (plans.py)."""
+    return f"fingerprint_check:{fp}"
+
+
+def _split_daily_fingerprint_checks(
+    watched: set[str], plan_id: str
+) -> tuple[list[str], list[str]]:
+    """Split watched fingerprints into (fresh, already_checked_today).
+
+    Free cap (FREE-TIER-CAPS.md): each fingerprint is checkable 1x/day,
+    manual only. Uses plans.py daily counters (one counter per
+    fingerprint). When the plan's fingerprint_checks_per_day limit is
+    unlimited (Starter and up), everything is fresh. When plans.py is
+    unavailable, no daily tracking exists and everything is fresh.
+    Returns sorted lists.
+    """
+    if _plans is None:
+        return sorted(watched), []
+    limit = (_plans.get_plan(plan_id).get("limits") or {}).get(
+        "fingerprint_checks_per_day")
+    if limit is None:
+        return sorted(watched), []
+    fresh, already = [], []
+    for fp in sorted(watched):
+        if _plans.daily_used(_fingerprint_check_key(fp)) >= limit:
+            already.append(fp)
+        else:
+            fresh.append(fp)
+    return fresh, already
+
+
+def _daily_recheck_prompt(plan_id: str) -> str:
+    """Upgrade prompt for a fingerprint already checked today."""
+    if _plans is not None:
+        return _plans.daily_cap_message(
+            plan_id, "fingerprint_checks_per_day", 1)
+    return (
+        "Free plan allows up to 1 fingerprint checks per day "
+        "(you have used 1 today). Upgrade to Starter ($49/mo) to unlock "
+        "automatic fingerprint monitoring — re-checks as often as you "
+        "like. Come back tomorrow, it works again "
+        "(free caps reset at midnight UTC).")
+
+
+def _apply_fingerprint_plan_limit(
+    watched: set[str], plan_id: str
+) -> tuple[set[str], str | None]:
+    """Enforce the plan's fingerprint limit on a watched set.
+
+    Returns (watched_to_check, upgrade_prompt_or_None). Never a silent
+    block and never a dead end: when the list is over the limit, the
+    prompt names the next tier + price + what it unlocks, and the check
+    still runs on the first N fingerprints (sorted, so the cut is
+    deterministic).
+    """
+    if _plans is not None:
+        allowed, message = _plans.check_limit(
+            plan_id, "fingerprints", len(watched))
+        if allowed:
+            return watched, None
+        limit = (_plans.get_plan(plan_id).get("limits") or {}).get(
+            "fingerprints")
+        prompt = message
+    else:
+        if plan_id == "free":
+            limit = FREE_FINGERPRINT_LIMIT
+        elif plan_id == "starter":
+            limit = STARTER_FINGERPRINT_LIMIT
+        else:
+            limit = None
+        if limit is None or len(watched) <= limit:
+            return watched, None
+        prompt = (
+            f"Free plan allows up to {limit} fingerprints "
+            f"(you have {len(watched)}). Upgrade to Starter ($49/mo) to "
+            "unlock fingerprint monitoring — alerts when a watched key "
+            "resurfaces in public code.")
+    ordered = sorted(watched)
+    truncated = set(ordered[:limit]) if limit is not None else watched
+    prompt += (
+        f"\ncheck: continuing with the first {limit} fingerprint(s) — "
+        "the free layer keeps working.")
+    return truncated, prompt
+
 # Known test vector: sha256("TESTFAKE-gsk_example_key_12345")[:16].
 TEST_KEY = "TESTFAKE-gsk_example_key_12345"
 TEST_KEY_FINGERPRINT = "06fabb99a6b4976b"
@@ -426,10 +535,33 @@ def cmd_check(args: argparse.Namespace) -> int:
         print(f"check: could not read {args.results}: {exc}", file=sys.stderr)
         return 2
 
+    # Plan gate (freemium layer): over-limit lists print the upgrade
+    # prompt and still check the first N fingerprints — never a block.
+    plan_id = _resolve_plan(args)
+    watched, plan_prompt = _apply_fingerprint_plan_limit(watched, plan_id)
+    if plan_prompt:
+        print(plan_prompt)
+
+    # Per-fingerprint 1x/day (Free cap): a fingerprint checked once
+    # today can be re-checked only tomorrow — but the result still
+    # displays (never a dead end). Dry runs do not consume a check.
+    fresh, already = _split_daily_fingerprint_checks(watched, plan_id)
+    if already:
+        print(_daily_recheck_prompt(plan_id))
+        print(f"check: {len(already)} fingerprint(s) already checked "
+              f"today (1x/day each on Free) — showing the result again; "
+              f"come back tomorrow, it works again.")
+    if not args.dry_run and _plans is not None:
+        for fp in fresh:
+            _plans.record_daily_use(_fingerprint_check_key(fp))
+
     rows = extract_rows(results)
     matches = find_matches(rows, watched)
     print(f"check: {len(rows)} finding(s) scanned, {len(watched)} "
           f"watched fingerprint(s), {len(matches)} match(es).")
+    checked_today = len(already) + (len(fresh) if not args.dry_run else 0)
+    print(f"check: fingerprint checks today: {checked_today} of "
+          f"{len(watched)} fingerprint(s) checked (1x/day each on Free).")
     if not matches:
         return 0
 
@@ -573,6 +705,12 @@ def main(argv: list[str] | None = None) -> int:
                               f"(default {DEFAULT_FINGERPRINTS_FILE})")
     p_check.add_argument("--dry-run", action="store_true",
                          help="print matches without POSTing them")
+    p_check.add_argument("--plan",
+                         choices=["free", "starter", "team", "business",
+                                  "enterprise"], default=None,
+                         help="plan to enforce (default: local "
+                              ".key-sentry-plan.json, else Free); testing "
+                              "only — real plan state comes from billing")
     p_check.set_defaults(func=cmd_check)
 
     p_self = sub.add_parser("selftest", help="sanity checks: hash vector, "

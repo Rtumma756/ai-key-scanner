@@ -32,3 +32,7 @@ vault-audit.jsonl
 .DS_Store
 Thumbs.db
 test-live/
+
+# KeySentry local daily-counter state (plans.py / mcp_server.py) — per-day
+# files on the operator's machine, never source, never committed.
+.key-sentry-*.json

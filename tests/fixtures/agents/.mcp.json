@@ -1,0 +1,1 @@
+{"mcpServers":{"github":{"args":["-y","@modelcontextprotocol/server-github"],"command":"npx","env":{"GITHUB_PERSONAL_ACCESS_TOKEN":"${GITHUB_TOKEN}"}},"groq-helper":{"args":["server.js"],"command":"node","env":{"GROQ_API_KEY":"TESTFAKE-gsk_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}}

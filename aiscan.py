@@ -87,6 +87,50 @@ from sources import (  # noqa: E402
     StackOverflowSource,
 )
 
+try:
+    import plans as _plans  # noqa: E402
+except ImportError:
+    _plans = None
+
+
+def _web_base_url() -> str:
+    """Web app base URL. KEYSENTRY_BASE_URL wins, KEYSENTRY_URL is the
+    legacy name (both are accepted); default is the live Vercel app."""
+    return (
+        os.environ.get("KEYSENTRY_BASE_URL")
+        or os.environ.get("KEYSENTRY_URL")
+        or "https://key-sentry-inky.vercel.app"
+    ).rstrip("/")
+
+
+def _print_audit_counter() -> None:
+    """Best-effort Agent Identity Audit counter display.
+
+    Fetches today's used/limit from the web counters endpoint and
+    prints "N of M audits used today" plus the upgrade prompt on a
+    cap hit. The CLI cannot know the server-side count, so this is a
+    display only — a failed fetch is silently skipped and the
+    inventory/mapping still prints. Never called for --json output
+    (machine-readable output stays pure).
+    """
+    if _plans is None:
+        return
+    import urllib.request  # stdlib only, same as fingerprint_watch.py
+    try:
+        with urllib.request.urlopen(
+                f"{_web_base_url()}/api/usage/counters",
+                timeout=5) as resp:
+            counters = json.loads(resp.read().decode("utf-8"))
+        audits = counters["counters"]["audits"]
+        used = audits["used"]
+        limit = audits["limit"]
+        print("  " + _plans.format_counter(used, limit, "audits"))
+        if limit is not None and used >= limit:
+            print("  " + _plans.daily_cap_message(
+                _plans.load_local_plan(), "audits_per_day", used))
+    except Exception:
+        pass  # counters endpoint unreachable: inventory still prints
+
 VERIFY_WARNING = (
     "WARNING: --verify sends each detected key to its provider as a "
     "read-only probe (model-list / balance endpoint). Only verify keys you "
@@ -464,6 +508,13 @@ def cmd_scan_local(args) -> int:
     if not os.path.exists(args.path):
         print(f"error: path does not exist: {args.path}", file=sys.stderr)
         return 2
+    if _plans is not None:
+        # Free includes 1 repo, so this only fires for future multi-repo
+        # runs. The scan still runs — the prompt is never a block.
+        _plan_id = _plans.load_local_plan()
+        _allowed, _msg = _plans.check_limit(_plan_id, "repos", 1)
+        if not _allowed:
+            print(_msg)
     if args.verify:
         print(VERIFY_WARNING, file=sys.stderr)
     metrics = RunMetrics(f"local:{args.path}")
@@ -697,6 +748,119 @@ def cmd_scan_commoncrawl(args) -> int:
     return 0
 
 
+def _plan_gate_multi_repo(plan_id, paths):
+    """Free covers one repo; print the upgrade prompt if more are given.
+
+    Today the agents commands take a single path, so this is a no-op
+    that keeps the paid boundary in one place for a future --repos flag.
+    Returns the (possibly truncated) path list; never blocks.
+    """
+    if _plans is None or len(paths) <= 1:
+        return paths
+    print(_plans.upgrade_message(plan_id, "full_audit_timeline"))
+    return paths[:1]
+
+
+def cmd_agents_inventory(args) -> int:
+    """Pillar 1: inventory agents + their credentials in <path>.
+
+    Output carries fingerprints and prefix4-masked values only — never
+    a raw key value.
+    """
+    from agents import build_inventory  # noqa: E402
+
+    _plan_id = _plans.load_local_plan() if _plans else "free"
+    _paths = _plan_gate_multi_repo(_plan_id, [args.path])
+    inventory = build_inventory(_paths[0])
+    if args.json:
+        print(json.dumps(inventory, indent=2))
+        return 0
+    print(f"agents inventory: {args.path}")
+    print(f"  {inventory['summary']['agent_count']} agent(s), "
+          f"{inventory['summary']['credential_count']} credential(s) "
+          f"({inventory['summary']['with_fingerprint']} with fingerprint, "
+          f"{inventory['summary']['env_var_references']} env-var reference(s))")
+    _print_audit_counter()
+    for agent in inventory["agents"]:
+        print(f"  - {agent['name']} [{agent['type']}] {agent['config_path']}")
+        for cred in agent["credentials"]:
+            if cred["fingerprint"]:
+                print(f"      {cred['provider']} {cred['masked']} "
+                      f"fp:{cred['fingerprint']} ({cred['source']})")
+            else:
+                print(f"      {cred['provider']} env ${cred['env_var']} "
+                      f"({cred['source']})")
+    return 0
+
+
+def cmd_agents_map(args) -> int:
+    """Pillar 1: agent -> credential -> repo -> owner mapping."""
+    from agents import build_mapping  # noqa: E402
+
+    _plan_id = _plans.load_local_plan() if _plans else "free"
+    _paths = _plan_gate_multi_repo(_plan_id, [args.path])
+    mapping = build_mapping(_paths[0])
+    if args.json:
+        print(json.dumps(mapping, indent=2))
+        return 0
+    print(f"agents map: {args.path}  repo={mapping['repo'] or '(unknown)'} "
+          f"owner={mapping['owner']}")
+    _print_audit_counter()
+    for agent in mapping["agents"]:
+        print(f"  - {agent['name']} [{agent['type']}] "
+              f"{len(agent['credentials'])} credential(s), "
+              f"{agent['exposed_count']} exposed, owner={agent['owner']}")
+        for cred in agent["credentials"]:
+            if cred["fingerprint"]:
+                exposed = "EXPOSED" if cred["fingerprint"] in {
+                    e["fingerprint"] for e in agent["exposed"]} else "not seen"
+                print(f"      {cred['provider']} {cred['masked']} "
+                      f"fp:{cred['fingerprint']} [{exposed}]")
+            else:
+                print(f"      {cred['provider']} env ${cred['env_var']}")
+    return 0
+
+
+def _plan_tier_choices():
+    """Tier ids for the `plan set-plan` choices, read from plans.json.
+
+    Dynamic so a new tier (e.g. Maker, added by the caps build) is
+    accepted without an aiscan.py change; falls back to the known list
+    if plans.py is absent or unreadable.
+    """
+    _fallback = ["free", "starter", "team", "business", "enterprise"]
+    if _plans is None:
+        return _fallback
+    try:
+        return list(_plans.load_plans().get("tiers", {}).keys()) or _fallback
+    except Exception:
+        return _fallback
+
+
+def cmd_plan_show(args) -> int:
+    if _plans is None:
+        print("plan definitions unavailable (plans.py missing)",
+              file=sys.stderr)
+        return 2
+    return _plans.main(["show"])
+
+
+def cmd_plan_set(args) -> int:
+    if _plans is None:
+        print("plan definitions unavailable (plans.py missing)",
+              file=sys.stderr)
+        return 2
+    return _plans.main(["set-plan", args.tier])
+
+
+def cmd_plan_counters(args) -> int:
+    if _plans is None:
+        print("plan definitions unavailable (plans.py missing)",
+              file=sys.stderr)
+        return 2
+    return _plans.main(["counters"])
+
+
 def cmd_metrics(args) -> int:
     """Fixture precision/recall scorecard (reuses selftest expectations).
 
@@ -854,6 +1018,39 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Max WARC records to fetch (default 3; keep tiny)")
     _add_common_scan_args(cc)
     cc.set_defaults(func=cmd_scan_commoncrawl)
+
+    agents_p = sub.add_parser("agents", help="Pillar 1: agent identity "
+                              "inventory (which agent holds which key)")
+    agents_sub = agents_p.add_subparsers(dest="agents_cmd", required=True)
+
+    ag_inv = agents_sub.add_parser("inventory", help="Inventory agents + "
+                                   "credentials in a path (fingerprints "
+                                   "and masked values only)")
+    ag_inv.add_argument("path", help="Directory (or config file) to scan")
+    ag_inv.add_argument("--json", action="store_true",
+                        help="Print the inventory as JSON")
+    ag_inv.set_defaults(func=cmd_agents_inventory)
+
+    ag_map = agents_sub.add_parser("map", help="Agent -> credential -> "
+                                 "repo -> owner mapping, with exposed counts")
+    ag_map.add_argument("path", help="Directory (or config file) to map")
+    ag_map.add_argument("--json", action="store_true",
+                        help="Print the mapping as JSON")
+    ag_map.set_defaults(func=cmd_agents_map)
+
+    plan_p = sub.add_parser("plan", help="Show or set the local plan "
+                            "(dev/testing only; real plan state comes "
+                            "from billing)")
+    plan_sub = plan_p.add_subparsers(dest="plan_cmd", required=True)
+    plan_show = plan_sub.add_parser("show", help="Print the current plan "
+                                    "+ limits")
+    plan_show.set_defaults(func=cmd_plan_show)
+    plan_set = plan_sub.add_parser("set-plan", help="Set the local dev plan")
+    plan_set.add_argument("tier", choices=_plan_tier_choices())
+    plan_set.set_defaults(func=cmd_plan_set)
+    plan_counters = plan_sub.add_parser("counters", help="Print today's "
+                                        "daily-cap counters")
+    plan_counters.set_defaults(func=cmd_plan_counters)
 
     mt = sub.add_parser("metrics", help="Fixture precision/recall scorecard")
     mt.set_defaults(func=cmd_metrics)
