@@ -1,0 +1,45 @@
+# Example: run KeySentry on every push and pull request.
+#
+# KeySentry is an ADD-ON layer, not a replacement for your existing
+# secret scanners: it catches AI-specific API keys (13 providers) that
+# slip past general scanners. Reports are masked-only (prefix4 +
+# SHA-256 fingerprints) — no raw key is ever logged or uploaded, and
+# verification is off, so no found key is ever sent to a provider API.
+#
+# CUSTOMERS: this file uses the local action (`uses: ./`) so the
+# scanner's own repo dogfoods it. In your repo, replace `uses: ./`
+# with the published action, e.g. `uses: <owner>/aiscan@v1`.
+name: KeySentry scan
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  keysentry:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the scan can also check deleted secrets.
+          fetch-depth: 0
+
+      - name: Scan for leaked AI API keys
+        id: keysentry
+        uses: ./
+        with:
+          paths: "."
+          # Fail the step on critical/high findings; use 'none' to
+          # report without failing, or 'medium'/'low' to be stricter.
+          fail-on: "high"
+
+      - name: Show finding count
+        if: always()
+        run: |
+          echo "KeySentry findings: ${{ steps.keysentry.outputs.finding-count }}"
+          echo "Masked report: ${{ steps.keysentry.outputs.findings-file }}"
+          # The masked-only JSON report is also uploaded as the
+          # `keysentry-report` artifact by the action itself.
